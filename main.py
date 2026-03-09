@@ -62,7 +62,7 @@ async def load_models():
     print("Loading embedding model...")
     embedding_model = SentenceTransformer(EMBEDDING_MODEL_ID)
     
-    print("Loading generation model for L4 GPU (Bfloat16 + Flash Attention 2)...")
+    print("Loading generation model for L4 GPU (Bfloat16)...")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     
@@ -71,8 +71,7 @@ async def load_models():
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "left"
 
-        # L4 Optimization: Use Bfloat16 and Flash Attention 2
-        # This requires ~16GB VRAM but is much faster than 4-bit quantization
+        # L4 Optimization: Use Bfloat16
         model_kwargs = {
             "torch_dtype": torch.bfloat16 if device == "cuda" else torch.float32,
             "device_map": "auto" if device == "cuda" else None,
@@ -81,8 +80,16 @@ async def load_models():
         }
         
         if device == "cuda":
-            # Enable Flash Attention 2 for major speedup on L4
-            model_kwargs["attn_implementation"] = "flash_attention_2"
+            # Detect if Flash Attention 2 can be used
+            # Requires flash-attn package and certain hardware
+            try:
+                import flash_attn
+                print("Flash Attention 2 detected and enabled.")
+                model_kwargs["attn_implementation"] = "flash_attention_2"
+            except ImportError:
+                print("Flash Attention 2 not found. Falling back to 'sdpa' (Scaled Dot Product Attention).")
+                # SDPA is built into PyTorch 2.0+ and is also very fast on L4
+                model_kwargs["attn_implementation"] = "sdpa"
 
         base_model = AutoModelForCausalLM.from_pretrained(
             BASE_MODEL_ID,
@@ -103,14 +110,11 @@ async def load_models():
             except Exception as e:
                 print(f"Model compilation skipped: {e}")
 
-        print("Generation model fully optimized for L4.")
+        used_attn = model_kwargs.get("attn_implementation", "eager")
+        print(f"Generation model fully optimized for L4. Using: {used_attn}")
 
     except Exception as e:
         print(f"Error loading generation model: {e}")
-        # Fallback to standard loading if Flash Attention 2 fails
-        if "flash_attention_2" in str(e):
-            print("Retrying without Flash Attention 2...")
-            # (Recursive call or logic to retry without flash_attn if needed)
         model = None
 
 @app.get("/health")
