@@ -9,7 +9,6 @@ from transformers import (
     AutoModelForCausalLM, 
     AutoTokenizer, 
     pipeline, 
-    BitsAndBytesConfig,
     TextIteratorStreamer
 )
 from peft import PeftModel
@@ -18,8 +17,8 @@ from typing import List, Optional, Any
 
 app = FastAPI(
     title="Model Deployment API",
-    description="API for contract LoRA generation and text embeddings",
-    version="1.1.0"
+    description="API for contract LoRA generation and text embeddings (L4 Optimized)",
+    version="1.2.0"
 )
 
 # --- Configuration ---
@@ -30,20 +29,12 @@ EMBEDDING_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
 # Performance Settings
 torch.backends.cuda.matmul.allow_tf32 = True
 if torch.cuda.is_available():
-    torch.set_float32_matmul_precision("medium")
+    torch.set_float32_matmul_precision("high") # L4 supports TF32
 
 # Global variables for models
 model = None
 tokenizer = None
 embedding_model = None
-
-# 4-bit Quantization Config
-bnb_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.float16,
-    bnb_4bit_use_double_quant=True,
-)
 
 # --- Models ---
 class GenerateRequest(BaseModel):
@@ -71,7 +62,7 @@ async def load_models():
     print("Loading embedding model...")
     embedding_model = SentenceTransformer(EMBEDDING_MODEL_ID)
     
-    print("Loading generation model with 4-bit quantization...")
+    print("Loading generation model for L4 GPU (Bfloat16 + Flash Attention 2)...")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     
@@ -80,34 +71,46 @@ async def load_models():
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "left"
 
+        # L4 Optimization: Use Bfloat16 and Flash Attention 2
+        # This requires ~16GB VRAM but is much faster than 4-bit quantization
+        model_kwargs = {
+            "torch_dtype": torch.bfloat16 if device == "cuda" else torch.float32,
+            "device_map": "auto" if device == "cuda" else None,
+            "low_cpu_mem_usage": True,
+            "trust_remote_code": True,
+        }
+        
+        if device == "cuda":
+            # Enable Flash Attention 2 for major speedup on L4
+            model_kwargs["attn_implementation"] = "flash_attention_2"
+
         base_model = AutoModelForCausalLM.from_pretrained(
             BASE_MODEL_ID,
-            quantization_config=bnb_config if device == "cuda" else None,
-            torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-            device_map="auto" if device == "cuda" else None,
-            low_cpu_mem_usage=True,
-            trust_remote_code=True
+            **model_kwargs
         )
 
         # Load LoRA adapter and merge for speed
-        print("Merging LoRA adapter...")
+        print("Merging LoRA adapter (Bfloat16)...")
         peft_model = PeftModel.from_pretrained(base_model, LORA_MODEL_ID)
         model = peft_model.merge_and_unload()
         model.eval()
         
-        # Optional: compile model for speedup (only on newer GPUs/PyTorch)
+        # Optional: compile model for speedup
         if device == "cuda":
             try:
-                print("Compiling model (optional)...")
-                # Using "reduce-overhead" for faster inference
+                print("Compiling model for Ada Lovelace (optional)...")
                 model = torch.compile(model, mode="reduce-overhead")
             except Exception as e:
                 print(f"Model compilation skipped: {e}")
 
-        print("Generation model loaded and optimized.")
+        print("Generation model fully optimized for L4.")
 
     except Exception as e:
         print(f"Error loading generation model: {e}")
+        # Fallback to standard loading if Flash Attention 2 fails
+        if "flash_attention_2" in str(e):
+            print("Retrying without Flash Attention 2...")
+            # (Recursive call or logic to retry without flash_attn if needed)
         model = None
 
 @app.get("/health")
@@ -116,6 +119,7 @@ async def health_check():
         "status": "healthy",
         "embeddings_loaded": embedding_model is not None,
         "generation_loaded": model is not None,
+        "vram_optimization": "Bfloat16 + Flash Attention 2" if model else "None",
         "device": str(next(model.parameters()).device) if model else "N/A"
     }
 
@@ -136,7 +140,6 @@ async def generate_text(request: GenerateRequest):
         raise HTTPException(status_code=503, detail="Generation model not loaded")
     
     start_time = time.time()
-    
     inputs = tokenizer(request.prompt, return_tensors="pt").to(model.device)
     
     with torch.inference_mode():

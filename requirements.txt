@@ -13,3 +13,4 @@ httpx
 streamlit
 PyPDF2
 requests
+flash-attn

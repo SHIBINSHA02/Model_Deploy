@@ -47,13 +47,47 @@ Tasks:
 # ──────────────────────────────────────────────
 def extract_json(text: str):
     """Pull the first JSON object out of a model response."""
-    match = re.search(r"\{.*\}", text, re.DOTALL)
+    # Try to find a JSON block between curly braces
+    match = re.search(r"(\{.*\})", text, re.DOTALL)
     if match:
         try:
-            return json.loads(match.group())
+            # Clean up some common issues like trailing commas or non-json junk
+            json_str = match.group(1).strip()
+            return json.loads(json_str)
         except json.JSONDecodeError:
-            pass
+            # If standard parsing fails, try a slightly more aggressive cleaning
+            try:
+                # Remove common non-essential trailing text or noise
+                cleaned = re.sub(r',\s*([\]}])', r'\1', json_str)
+                return json.loads(cleaned)
+            except:
+                pass
     return None
+
+def merge_results(final_data: dict, new_data: dict):
+    """Merge new chunk analysis into the final synthesized data."""
+    if not final_data:
+        return new_data
+    
+    for key, val in new_data.items():
+        if key not in final_data:
+            final_data[key] = val
+        else:
+            if isinstance(val, list):
+                # Extend lists (avoid duplicates if possible)
+                if isinstance(final_data[key], list):
+                    final_data[key].extend([i for i in val if i not in final_data[key]])
+            elif isinstance(val, str):
+                # Append strings if they are different
+                if val not in final_data[key]:
+                    final_data[key] += "\n" + val
+            elif isinstance(val, dict):
+                # Recursively merge dicts
+                if isinstance(final_data[key], dict):
+                    merge_results(final_data[key], val)
+                else:
+                    final_data[key] = val
+    return final_data
 
 def chunk_text_approx(text: str) -> list[str]:
     """
@@ -102,11 +136,11 @@ def generate_stream_api(chunk: str, role: str):
     except Exception as e:
         yield f"Error connecting to backend: {str(e)}"
 
-def analyze_contract_api(text: str, role: str) -> str:
-    """Chunk the full contract and call the streaming API for each piece."""
+def analyze_contract_api(text: str, role: str) -> dict:
+    """Chunk the full contract, call the streaming API, and merge JSON results."""
     chunks = chunk_text_approx(text)
     
-    full_output = ""
+    synthesized_data = {}
     progress_bar = st.progress(0)
     status_text = st.empty()
 
@@ -122,16 +156,19 @@ def analyze_contract_api(text: str, role: str) -> str:
             for token in generate_stream_api(chunk, role):
                 chunk_output += token
                 # Update the container in real-time
-                # Note: This gives immediate visual feedback
                 output_container.markdown(chunk_output + "▌")
             
             output_container.markdown(chunk_output) # Final update without cursor
-            full_output += chunk_output + "\n"
+            
+            # Parse this chunk's JSON and merge it
+            chunk_json = extract_json(chunk_output)
+            if chunk_json:
+                synthesized_data = merge_results(synthesized_data, chunk_json)
         
         progress_bar.progress((i + 1) / len(chunks))
 
     status_text.text("Analysis complete ✓")
-    return full_output
+    return synthesized_data
 
 # ──────────────────────────────────────────────
 # STREAMLIT UI
@@ -173,12 +210,12 @@ if file and st.button("Analyze Contract", type="primary"):
 
     # ── Run analysis ───────────────────────────
     # We display results directly during analyze_contract_api now
-    raw_result   = analyze_contract_api(text, role)
-    json_result  = extract_json(raw_result)
+    json_result = analyze_contract_api(text, role)
 
-    # ── Display processed results (Optional if streaming already showed it) ──
+    # ── Display processed results ──
     if json_result:
-        st.success("Analysis Parsed Successfully!")
+        st.divider()
+        st.success("Analysis Synthesized Successfully!")
         # Render each top-level key as a nice expandable section
         for section, content in json_result.items():
             label = section.replace("_", " ").title()
@@ -193,10 +230,10 @@ if file and st.button("Analyze Contract", type="primary"):
                     st.write(content)
 
         st.divider()
-        with st.expander("Raw JSON"):
+        with st.expander("Final Synthesized JSON"):
             st.json(json_result)
     else:
-        st.warning("Could not parse full JSON from combined chunks. See raw outputs above.")
+        st.warning("Could not synthesize full JSON. Please check the section outputs above for details.")
 
 # Sidebar info
 st.sidebar.title("System Info")
