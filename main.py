@@ -1,16 +1,25 @@
 import torch
+import json
+import time
+import threading
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+from transformers import (
+    AutoModelForCausalLM, 
+    AutoTokenizer, 
+    pipeline, 
+    BitsAndBytesConfig,
+    TextIteratorStreamer
+)
 from peft import PeftModel
 from sentence_transformers import SentenceTransformer
-from typing import List, Optional
-import time
+from typing import List, Optional, Any
 
 app = FastAPI(
     title="Model Deployment API",
     description="API for contract LoRA generation and text embeddings",
-    version="1.0.0"
+    version="1.1.0"
 )
 
 # --- Configuration ---
@@ -18,9 +27,23 @@ LORA_MODEL_ID = "shibinsha02/contract-lora"
 BASE_MODEL_ID = "StevenChen16/llama3-8b-Lawyer"
 EMBEDDING_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
 
+# Performance Settings
+torch.backends.cuda.matmul.allow_tf32 = True
+if torch.cuda.is_available():
+    torch.set_float32_matmul_precision("medium")
+
 # Global variables for models
-generation_pipeline = None
+model = None
+tokenizer = None
 embedding_model = None
+
+# 4-bit Quantization Config
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.float16,
+    bnb_4bit_use_double_quant=True,
+)
 
 # --- Models ---
 class GenerateRequest(BaseModel):
@@ -43,48 +66,57 @@ class EmbeddingResponse(BaseModel):
 # --- Startup Event ---
 @app.on_event("startup")
 async def load_models():
-    global generation_pipeline, embedding_model
+    global model, tokenizer, embedding_model
     
     print("Loading embedding model...")
     embedding_model = SentenceTransformer(EMBEDDING_MODEL_ID)
     
-    print("Loading generation model (this might take a while)...")
-    # Setting up device
+    print("Loading generation model with 4-bit quantization...")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     
-    # Load tokenizer and base model
-    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_ID)
-    
-    # Load with 4-bit quantization if possible for Llama 3 on typical GPUs
-    # Otherwise fallback to float16 or float32
     try:
+        tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_ID)
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "left"
+
         base_model = AutoModelForCausalLM.from_pretrained(
             BASE_MODEL_ID,
+            quantization_config=bnb_config if device == "cuda" else None,
             torch_dtype=torch.float16 if device == "cuda" else torch.float32,
             device_map="auto" if device == "cuda" else None,
-            low_cpu_mem_usage=True
+            low_cpu_mem_usage=True,
+            trust_remote_code=True
         )
-        # Load LoRA adapter
-        model = PeftModel.from_pretrained(base_model, LORA_MODEL_ID)
+
+        # Load LoRA adapter and merge for speed
+        print("Merging LoRA adapter...")
+        peft_model = PeftModel.from_pretrained(base_model, LORA_MODEL_ID)
+        model = peft_model.merge_and_unload()
+        model.eval()
         
-        generation_pipeline = pipeline(
-            "text-generation",
-            model=model,
-            tokenizer=tokenizer,
-            device_map="auto" if device == "cuda" else None
-        )
+        # Optional: compile model for speedup (only on newer GPUs/PyTorch)
+        if device == "cuda":
+            try:
+                print("Compiling model (optional)...")
+                # Using "reduce-overhead" for faster inference
+                model = torch.compile(model, mode="reduce-overhead")
+            except Exception as e:
+                print(f"Model compilation skipped: {e}")
+
+        print("Generation model loaded and optimized.")
+
     except Exception as e:
         print(f"Error loading generation model: {e}")
-        # Placeholder/Mock for local testing if hardware is insufficient
-        generation_pipeline = None
+        model = None
 
 @app.get("/health")
 async def health_check():
     return {
         "status": "healthy",
         "embeddings_loaded": embedding_model is not None,
-        "generation_loaded": generation_pipeline is not None
+        "generation_loaded": model is not None,
+        "device": str(next(model.parameters()).device) if model else "N/A"
     }
 
 @app.post("/embeddings", response_model=EmbeddingResponse)
@@ -100,26 +132,59 @@ async def get_embeddings(request: EmbeddingRequest):
 
 @app.post("/generate", response_model=GenerateResponse)
 async def generate_text(request: GenerateRequest):
-    if generation_pipeline is None:
-        raise HTTPException(status_code=503, detail="Generation model not loaded or hardware insufficient")
+    if model is None:
+        raise HTTPException(status_code=503, detail="Generation model not loaded")
     
     start_time = time.time()
     
-    outputs = generation_pipeline(
-        request.prompt,
-        max_new_tokens=request.max_new_tokens,
-        temperature=request.temperature,
-        top_p=request.top_p,
-        do_sample=True if request.temperature > 0 else False
-    )
+    inputs = tokenizer(request.prompt, return_tensors="pt").to(model.device)
     
-    generated_text = outputs[0]["generated_text"]
+    with torch.inference_mode():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=request.max_new_tokens,
+            temperature=request.temperature if request.temperature > 0 else 1.0,
+            top_p=request.top_p,
+            do_sample=True if request.temperature > 0 else False,
+            use_cache=True,
+            pad_token_id=tokenizer.eos_token_id
+        )
+    
+    generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
     end_time = time.time()
     
     return GenerateResponse(
         generated_text=generated_text,
         generation_time=round(end_time - start_time, 2)
     )
+
+@app.post("/generate_stream")
+async def generate_stream(request: GenerateRequest):
+    if model is None:
+        raise HTTPException(status_code=503, detail="Generation model not loaded")
+
+    inputs = tokenizer(request.prompt, return_tensors="pt").to(model.device)
+    streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+
+    generation_kwargs = dict(
+        **inputs,
+        max_new_tokens=request.max_new_tokens,
+        temperature=request.temperature if request.temperature > 0 else 1.0,
+        top_p=request.top_p,
+        do_sample=True if request.temperature > 0 else False,
+        use_cache=True,
+        streamer=streamer,
+        pad_token_id=tokenizer.eos_token_id,
+    )
+
+    def generate_with_stream():
+        thread = threading.Thread(target=model.generate, kwargs=generation_kwargs)
+        thread.start()
+        for new_text in streamer:
+            yield new_text
+        thread.join()
+
+    return StreamingResponse(generate_with_stream(), media_type="text/plain")
 
 if __name__ == "__main__":
     import uvicorn

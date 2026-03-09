@@ -10,3 +10,6 @@ bitsandbytes
 python-multipart
 python-dotenv
 httpx
+streamlit
+PyPDF2
+requests
